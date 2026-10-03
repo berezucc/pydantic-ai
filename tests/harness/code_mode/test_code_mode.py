@@ -3477,35 +3477,57 @@ class TestInferReturnSchemas:
             },
         }
 
-    async def test_shapes_survive_across_runs_of_one_capability(self) -> None:
-        """A shape learned through one wrapper toolset shows up in the next run's first render."""
-        static = _StaticToolset([_schema_less_tool_def()], results={'search': {'total': 1}})
-        cap = CodeMode[object](infer_return_schemas=True)
+    async def test_second_run_starts_without_learned_shapes(self) -> None:
+        """Shapes learned in one run upgrade that run's later renders but not the next run's.
 
-        first = cap.get_wrapper_toolset(static)
-        assert isinstance(first, CodeModeToolset)
-        ctx = await build_ctx(None, first)
-        tools = await first.get_tools(ctx)
-        await first.call_tool('run_code', {'code': 'r = await search(q="x")\nr'}, ctx, tools['run_code'])
+        A shared agent must not carry one user's result keys into another user's catalog.
+        """
+        descriptions: list[str] = []
 
-        second = cap.get_wrapper_toolset(static)
-        assert isinstance(second, CodeModeToolset)
-        tools = await second.get_tools(await build_ctx(None, second))
-        description = tools['run_code'].tool_def.description
-        assert description is not None
-        assert 'async def search(*, q: str) -> SearchReturn:' in description
+        def model_fn(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+            run_code = next(t for t in info.function_tools if t.name == 'run_code')
+            assert run_code.description is not None
+            descriptions.append(run_code.description)
+            last_request = messages[-1]
+            assert isinstance(last_request, ModelRequest)
+            if any(isinstance(part, ToolReturnPart) for part in last_request.parts):
+                return ModelResponse(parts=[TextPart('done')])
+            return ModelResponse(parts=[ToolCallPart('run_code', {'code': 'r = await search(q="x")\nr'})])
 
-    @pytest.mark.parametrize('kwargs', [{'dynamic_catalog': True}, {'speculate': ['search']}, {'eager': True}])
-    async def test_per_run_copies_share_learned_shapes(self, kwargs: dict[str, Any]) -> None:
-        """`for_run` copies and the eager toolset write into the capability's one cache."""
+        static = _StaticToolset([_schema_less_tool_def()], results={'search': {'private_project': 1}})
+        agent: Agent[object, str] = Agent(
+            FunctionModel(model_fn), toolsets=[static], capabilities=[CodeMode[object](infer_return_schemas=True)]
+        )
+
+        await agent.run('first user')
+        await agent.run('second user')
+
+        first_run_start, first_run_after_call, second_run_start, _ = descriptions
+        assert '-> Any' in first_run_start
+        assert 'private_project' in first_run_after_call
+        assert '-> Any' in second_run_start
+        assert 'private_project' not in second_run_start
+
+    @pytest.mark.parametrize('kwargs', [{}, {'dynamic_catalog': True}, {'speculate': ['search']}, {'eager': True}])
+    async def test_per_run_clone_gets_its_own_cache(self, kwargs: dict[str, Any]) -> None:
+        """Every toolset one run's clone builds shares that run's cache; other runs get another."""
         static = _StaticToolset([_schema_less_tool_def()])
         cap = CodeMode[object](infer_return_schemas=True, **kwargs)
-        clone = await cap.for_run(build_run_context(None))
-        original = cap.get_wrapper_toolset(static)
-        copied = clone.get_wrapper_toolset(static)
-        assert isinstance(original, CodeModeToolset) and isinstance(copied, CodeModeToolset)
-        assert original.inferred_return_schemas is not None
-        assert copied.inferred_return_schemas is original.inferred_return_schemas
+        first = await cap.for_run(build_run_context(None))
+        second = await cap.for_run(build_run_context(None))
+        assert first is not cap and second is not cap
+        a = first.get_wrapper_toolset(static)
+        b = first.get_wrapper_toolset(static)
+        other = second.get_wrapper_toolset(static)
+        assert isinstance(a, CodeModeToolset) and isinstance(b, CodeModeToolset)
+        assert isinstance(other, CodeModeToolset)
+        assert a.inferred_return_schemas is not None
+        assert b.inferred_return_schemas is a.inferred_return_schemas
+        assert other.inferred_return_schemas is not a.inferred_return_schemas
+
+        run_copy = await a.for_run(build_run_context(None))
+        assert isinstance(run_copy, CodeModeToolset)
+        assert run_copy.inferred_return_schemas is a.inferred_return_schemas
 
     async def test_capability_passes_cache_only_when_enabled(self) -> None:
         static = _StaticToolset([_schema_less_tool_def()])
@@ -3618,6 +3640,44 @@ class TestInferReturnSchemas:
 
         schema = next(iter(cache.values()))
         assert len(schema['properties']) == 50
+
+    async def test_total_node_budget_collapses_oversized_result(self) -> None:
+        """Per-object caps reset per object, so a total budget bounds the whole inferred schema."""
+        # Each child has a distinct key so the parent is not mistaken for a lookup map.
+        wide_dict = {f'c{i}': {f'c{i}_f{j}': (j if j % 2 else str(j)) for j in range(20)} for i in range(30)}
+        wide_list = [{f'f{j}': [{'a': 1, 'b': 'x'}] * 5 for j in range(40)}] * 5
+        static = _StaticToolset(
+            [_schema_less_tool_def('t_dict'), _schema_less_tool_def('t_list')],
+            results={'t_dict': wide_dict, 't_list': wide_list},
+        )
+        cache: dict[str, Any] = {}
+        toolset = CodeModeToolset(wrapped=static, tool_selector='all', inferred_return_schemas=cache)
+        ctx = await build_ctx(None, toolset)
+
+        tools = await toolset.get_tools(ctx)
+        code = 'a = await t_dict(q="x")\nb = await t_list(q="x")\n1'
+        await toolset.call_tool('run_code', {'code': code}, ctx, tools['run_code'])
+
+        assert {k.split(':', 1)[0]: v for k, v in cache.items()} == {
+            't_dict': {'type': 'object'},
+            't_list': {'type': 'array'},
+        }
+        tools = await toolset.get_tools(ctx)
+        description = tools['run_code'].tool_def.description
+        assert description is not None
+        assert 'c0_f0' not in description
+
+    async def test_list_agreement_reads_a_bounded_prefix(self) -> None:
+        """Only the first few list elements are inferred; later ones are not inspected."""
+        result: list[Any] = [1] * 5 + ['not inspected']
+        static = _StaticToolset([_schema_less_tool_def()], results={'search': result})
+        cache: dict[str, Any] = {}
+        toolset = CodeModeToolset(wrapped=static, tool_selector='all', inferred_return_schemas=cache)
+        ctx = await build_ctx(None, toolset)
+
+        tools = await toolset.get_tools(ctx)
+        await toolset.call_tool('run_code', {'code': 'r = await search(q="x")\nr'}, ctx, tools['run_code'])
+        assert next(iter(cache.values())) == {'type': 'array', 'items': {'type': 'integer'}}
 
     async def test_map_like_dict_is_genericized(self) -> None:
         """Ten or more identically-shaped keys read as a lookup map; its data-bearing keys must not leak."""

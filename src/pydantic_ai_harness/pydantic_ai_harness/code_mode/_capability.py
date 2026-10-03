@@ -212,13 +212,15 @@ class CodeMode(AbstractCapability[AgentDepsT]):
     `-> Any` and the model has to guess response shapes, which costs retries and
     tokens. With this flag on, the shape of each such tool's first successful
     result is captured and substituted into later renders of the signature (and
-    into the sandbox type-check stubs) in place of `Any`. Learned shapes persist
-    across runs of the same capability instance.
+    into the sandbox type-check stubs) in place of `Any`. Learned shapes last for
+    one agent run: each run starts from `-> Any`, so shapes learned from one
+    user's results do not reach another run's prompt.
 
     Off by default because an updated signature changes `run_code`'s description,
     which lives in the prompt-cache-keyed tool-definitions block, so the cache
-    prefix is busted once per learned tool. With `dynamic_catalog=True` the
-    catalog lives in dynamic instructions instead, where an update is cache-cheap.
+    prefix is busted once per learned tool in every run. With
+    `dynamic_catalog=True` the catalog lives in dynamic instructions instead,
+    where an update is cache-cheap.
 
     Inferred schemas are best-effort: they come from a single sample, so variants
     that sample didn't show (optional fields, error shapes, mixed-type arrays)
@@ -232,9 +234,8 @@ class CodeMode(AbstractCapability[AgentDepsT]):
 
     _in_flight_announcements: set[str] = field(default_factory=set[str], init=False, repr=False)
 
-    # Shared across `for_run` copies and passed by reference into every
-    # `CodeModeToolset` this capability builds, so shapes learned in one run
-    # improve signatures in later runs.
+    # Passed by reference into every `CodeModeToolset` this instance builds. `for_run`
+    # gives each run a fresh dict, so learned shapes never outlive the run.
     _inferred_return_schemas: dict[str, Any] = field(default_factory=dict[str, Any], init=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -251,15 +252,14 @@ class CodeMode(AbstractCapability[AgentDepsT]):
         return CapabilityOrdering(position='outermost', wraps=[_ToolSearch])
 
     async def for_run(self, ctx: RunContext[AgentDepsT]) -> CodeMode[AgentDepsT]:
-        """Return a fresh instance so concurrent runs don't share announcement or speculation state."""
-        if not self.dynamic_catalog and self.speculate is None:
+        """Return a fresh instance so runs don't share announcement, speculation, or inferred-schema state."""
+        if not self.dynamic_catalog and self.speculate is None and not self.infer_return_schemas:
             return self
         clone = replace(self)
-        # `replace` re-runs `__init__`, resetting `init=False` fields: in-flight announcements start
-        # fresh (intended), and the stats object is rebound so callers holding this instance
-        # observe counters accumulated by its per-run clones.
+        # `replace` re-runs `__init__`, resetting `init=False` fields: in-flight announcements and
+        # inferred return schemas start fresh (intended), and the stats object is rebound so callers
+        # holding this instance observe counters accumulated by its per-run clones.
         clone.speculation_stats = self.speculation_stats
-        clone._inferred_return_schemas = self._inferred_return_schemas
         if self.speculate is not None:
             allowlist = 'declared' if isinstance(self.speculate, str) else frozenset(self.speculate)
             clone._speculation = SpeculationCoordinator(

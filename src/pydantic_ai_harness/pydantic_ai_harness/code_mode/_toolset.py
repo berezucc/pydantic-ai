@@ -582,6 +582,25 @@ _INFER_MAX_DEPTH = 5
 _INFER_MAX_PROPERTIES = 50
 _INFER_MAX_KEY_LENGTH = 64
 _INFER_MAP_LIKE_MIN_KEYS = 10
+# List elements inspected for agreement; the rest of the list is not read.
+_INFER_MAX_LIST_ITEMS = 5
+# Total values inspected for one result. The per-object and depth caps alone
+# still allow `_INFER_MAX_PROPERTIES ** _INFER_MAX_DEPTH` nodes.
+_INFER_MAX_NODES = 500
+
+
+class _InferBudgetExceeded(Exception):
+    """Raised when one inferred schema would inspect more than `_INFER_MAX_NODES` values."""
+
+
+@dataclass
+class _InferBudget:
+    remaining: int = _INFER_MAX_NODES
+
+    def spend(self) -> None:
+        self.remaining -= 1
+        if self.remaining < 0:
+            raise _InferBudgetExceeded
 
 
 def _is_safe_schema_key(key: str) -> bool:
@@ -595,8 +614,8 @@ def _is_safe_schema_key(key: str) -> bool:
     return key.isidentifier() and not keyword.iskeyword(key) and len(key) <= _INFER_MAX_KEY_LENGTH
 
 
-def _infer_object_schema(value: dict[Any, Any], depth: int) -> dict[str, Any]:
-    """The dict branch of `_infer_return_schema`: a record infers properties, a lookup map does not.
+def _infer_object_schema(value: dict[Any, Any], depth: int, budget: _InferBudget) -> dict[str, Any]:
+    """The dict branch of `_infer_node`: a record infers properties, a lookup map does not.
 
     A map's keys are data (usernames, tenant ids) and must not leak into the
     model-facing schema, while a record's keys are field names worth surfacing.
@@ -611,7 +630,7 @@ def _infer_object_schema(value: dict[Any, Any], depth: int) -> dict[str, Any]:
             continue
         if len(properties) == _INFER_MAX_PROPERTIES:
             break
-        properties[key] = _infer_return_schema(v, _depth=depth + 1)
+        properties[key] = _infer_node(v, depth + 1, budget)
     if value and not properties:
         return {}
     if len(properties) >= _INFER_MAP_LIKE_MIN_KEYS:
@@ -621,20 +640,8 @@ def _infer_object_schema(value: dict[Any, Any], depth: int) -> dict[str, Any]:
     return {'type': 'object', 'properties': properties}
 
 
-def _infer_return_schema(value: Any, *, _depth: int = 0) -> dict[str, Any]:
-    """Best-effort JSON schema for a single sample tool result.
-
-    Object properties carry no `required` list and arrays only get an `items`
-    schema when every element infers identically: one sample can show a shape
-    but cannot prove which parts of it are stable. Values that don't map to a
-    JSON type produce `{}` (unconstrained), which renders as `Any`. Object keys
-    that fail `_is_safe_schema_key` are dropped; an object whose keys all drop
-    infers as `{}` so the capture site skips caching it. Nesting past
-    `_INFER_MAX_DEPTH` collapses to an untyped object/array, and a dict that
-    looks like a lookup map rather than a record (`_INFER_MAP_LIKE_MIN_KEYS`+
-    keys, all with the same shape) infers as an untyped object so data-bearing
-    keys stay out of the schema.
-    """
+def _infer_node(value: Any, depth: int, budget: _InferBudget) -> dict[str, Any]:
+    budget.spend()
     if value is None:
         return {'type': 'null'}
     if isinstance(value, bool):  # before int: bool is an int subclass
@@ -646,26 +653,52 @@ def _infer_return_schema(value: Any, *, _depth: int = 0) -> dict[str, Any]:
     if isinstance(value, str):
         return {'type': 'string'}
     if isinstance(value, dict):
-        if _depth >= _INFER_MAX_DEPTH:
+        if depth >= _INFER_MAX_DEPTH:
             return {'type': 'object'}
-        return _infer_object_schema(value, _depth)  # pyright: ignore[reportUnknownArgumentType]
+        return _infer_object_schema(value, depth, budget)  # pyright: ignore[reportUnknownArgumentType]
     if isinstance(value, list):
-        if _depth >= _INFER_MAX_DEPTH:
+        if depth >= _INFER_MAX_DEPTH:
             return {'type': 'array'}
-        item_schemas = [_infer_return_schema(item, _depth=_depth + 1) for item in value]  # pyright: ignore[reportUnknownVariableType]
+        item_schemas = [_infer_node(item, depth + 1, budget) for item in value[:_INFER_MAX_LIST_ITEMS]]  # pyright: ignore[reportUnknownVariableType]
         if item_schemas and all(s == item_schemas[0] for s in item_schemas[1:]):
             return {'type': 'array', 'items': item_schemas[0]}
         return {'type': 'array'}
     return {}
 
 
+def _infer_return_schema(value: Any) -> dict[str, Any]:
+    """Best-effort JSON schema for a single sample tool result.
+
+    Object properties carry no `required` list and arrays only get an `items`
+    schema when their first `_INFER_MAX_LIST_ITEMS` elements infer identically:
+    one sample can show a shape but cannot prove which parts of it are stable.
+    Values that don't map to a JSON type produce `{}` (unconstrained), which
+    renders as `Any`. Object keys that fail `_is_safe_schema_key` are dropped;
+    an object whose keys all drop infers as `{}` so the capture site skips
+    caching it. Nesting past `_INFER_MAX_DEPTH` collapses to an untyped
+    object/array, and a dict that looks like a lookup map rather than a record
+    (`_INFER_MAP_LIKE_MIN_KEYS`+ keys, all with the same shape) infers as an
+    untyped object so data-bearing keys stay out of the schema.
+
+    A result that needs more than `_INFER_MAX_NODES` values to describe infers
+    as a bare untyped object or array. Collapsing the whole result, rather than
+    only the part past the budget, keeps a lookup map whose later values went
+    untyped from passing as a record and leaking its keys.
+    """
+    try:
+        return _infer_node(value, 0, _InferBudget())
+    except _InferBudgetExceeded:
+        # Only containers can exceed the budget.
+        return {'type': 'object'} if isinstance(value, dict) else {'type': 'array'}
+
+
 def _tool_identity_key(td: ToolDefinition) -> str:
     """Cache key for an inferred return schema: tool name plus a parameter-schema digest.
 
-    Keying by bare name would let a later run that exposes a *different* tool
-    under the same name inherit a shape learned from the earlier tool's output
-    (the cache dict outlives runs by design). The parameter schema is the stable
-    part of a tool's identity, so a redefined tool starts fresh instead.
+    Keying by bare name would let a *different* tool that later appears under
+    the same name in the same run (for example after a toolset swap) inherit a
+    shape learned from the earlier tool's output. The parameter schema is the
+    stable part of a tool's identity, so a redefined tool starts fresh instead.
     """
     canonical = json.dumps(td.parameters_json_schema, sort_keys=True, separators=(',', ':'), default=str)
     digest = hashlib.sha256(canonical.encode('utf-8')).hexdigest()[:12]
@@ -933,10 +966,11 @@ class CodeModeToolset(WrapperToolset[AgentDepsT]):
     inferred_return_schemas: dict[str, Any] | None = field(default=None, kw_only=True, repr=False)
     """Return schemas inferred from first tool results, keyed by tool identity.
 
-    `None` (default) disables inference. The `CodeMode` capability passes its own dict
-    here (see `CodeMode.infer_return_schemas`) so learned shapes survive the fresh
-    instances `for_run` creates and carry over to later runs. Pass an empty dict to
-    enable inference on a standalone toolset. Keys are internal: the tool name plus a
+    `None` (default) disables inference. The `CodeMode` capability passes a fresh dict per
+    agent run (see `CodeMode.infer_return_schemas`), so learned shapes are shared by this
+    run's toolset copies and dropped when the run ends. Pass an empty dict to enable
+    inference on a standalone toolset; the copies `for_run` makes share it, so shapes then
+    last as long as the caller keeps the dict. Keys are internal: the tool name plus a
     digest of its parameter schema, so a later tool that merely reuses a name does not
     inherit a shape learned from a different tool's output.
     """
